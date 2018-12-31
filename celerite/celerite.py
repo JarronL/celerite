@@ -2,26 +2,13 @@
 
 from __future__ import division, print_function
 import math
-import logging
+import warnings
 import numpy as np
 
-from . import solver
+from . import solver, terms
 from .modeling import ModelSet, ConstantModel
 
-__all__ = ["GP", "get_solver"]
-
-
-def get_solver(method=None):
-    if method is None or method == "default":
-        if solver.with_lapack():
-            return solver.Solver(True)
-        if solver.with_sparse():
-            return solver.SparseSolver()
-    elif method == "lapack" and solver.with_lapack():
-        return solver.Solver(True)
-    elif method == "sparse" and solver.with_sparse():
-        return solver.SparseSolver()
-    return solver.Solver(False)
+__all__ = ["GP"]
 
 
 class GP(ModelSet):
@@ -35,77 +22,29 @@ class GP(ModelSet):
         fit_mean (optional): If ``False``, all of the parameters of ``mean``
             will be frozen. Otherwise, the parameter states are unaffected.
             (default: ``False``)
-        log_white_noise (Optional): A white noise model for the process. The
-            ``exp`` of this will be added to the diagonal of the matrix in
-            :func:`GP.compute`. In other words this model should be for the
-            log of the _variance_ of the white noise. This can either be a
-            ``float`` or a subclass of :class:`modeling.Model`.
-            (default: ``-inf``)
-        fit_white_noise (Optional): If ``False``, all of the parameters of
-            ``log_white_noise`` will be frozen. Otherwise, the parameter
-            states are unaffected. (default: ``False``)
-        method: Select a matrix solver method by name. This can be one of
-            (a) ``simple``: a simple banded Gaussian elimination based method,
-            (b) ``lapack``: an optimized band solver if compiled with LAPACK,
-            (c) ``sparse``: a sparse solver if compiled with Eigen/Sparse, or
-            (d) ``default``: uses heuristics to select the fastest method that
-            is available.
 
     """
 
     def __init__(self,
                  kernel,
                  mean=0.0, fit_mean=False,
-                 log_white_noise=-float("inf"), fit_white_noise=False,
-                 method=None):
-        self.solver = None
+                 log_white_noise=None, fit_white_noise=False):
+        self._solver = None
         self._computed = False
         self._t = None
         self._y_var = None
 
-        # Choose which solver to use
-        use_sparse = False
-        use_lapack = False
-        if method is None or method == "default":
-            coeffs = kernel.coefficients
-            nterms = len(coeffs[0]) + 2 * len(coeffs[2])
-            if solver.with_lapack():
-                use_lapack = (nterms >= 8)
-            elif solver.with_sparse():
-                use_sparse = (nterms >= 8)
-        elif method == "simple":
-            pass
-        elif method == "lapack":
-            use_lapack = solver.with_lapack()
-            if not use_lapack:
-                logging.warn("celerite was not compiled with LAPACK support")
-        elif method == "sparse":
-            use_sparse = solver.with_sparse()
-            if not use_sparse:
-                logging.warn("celerite was not compiled with Sparse support")
-        else:
-            logging.warn("'method' must be one of ['default', 'simple', "
-                         "'lapack', 'sparse']; falling back on 'simple'")
-        self._use_sparse = bool(use_sparse)
-        self._use_lapack = bool(use_lapack)
+        # Backwards compatibility for 'log_white_noise' parameter
+        if log_white_noise is not None:
+            warnings.warn("The 'log_white_noise' parameter is deprecated. "
+                          "Use a 'JitterTerm' instead.")
+            k = terms.JitterTerm(log_sigma=float(log_white_noise))
+            if not fit_white_noise:
+                k.freeze_parameter("log_sigma")
+            kernel += k
 
         # Build up a list of models for the ModelSet
         models = [("kernel", kernel)]
-
-        # Interpret the white noise model
-        try:
-            float(log_white_noise)
-        except TypeError:
-            pass
-        else:
-            log_white_noise = ConstantModel(float(log_white_noise))
-
-        # If this model is supposed to be constant, go through and freeze
-        # all of the parameters
-        if not fit_white_noise:
-            for k in log_white_noise.get_parameter_names():
-                log_white_noise.freeze_parameter(k)
-        models += [("log_white_noise", log_white_noise)]
 
         # And the mean model
         try:
@@ -124,14 +63,15 @@ class GP(ModelSet):
         super(GP, self).__init__(models)
 
     @property
+    def solver(self):
+        if self._solver is None:
+            self._solver = solver.CholeskySolver()
+        return self._solver
+
+    @property
     def mean(self):
         """The mean :class:`modeling.Model`"""
         return self.models["mean"]
-
-    @property
-    def log_white_noise(self):
-        """The white noise :class:`modeling.Model`"""
-        return self.models["log_white_noise"]
 
     @property
     def kernel(self):
@@ -149,12 +89,13 @@ class GP(ModelSet):
     @property
     def computed(self):
         return (
-            self.solver is not None and
+            self._solver is not None and
             self.solver.computed() and
             not self.dirty
         )
 
-    def compute(self, t, yerr=1.123e-12, check_sorted=True):
+    def compute(self, t, yerr=1.123e-12, check_sorted=True,
+                A=None, U=None, V=None):
         """
         Compute the extended form of the covariance matrix and factorize
 
@@ -171,6 +112,7 @@ class GP(ModelSet):
 
         Raises:
             ValueError: For un-sorted data or mismatched dimensions.
+            solver.LinAlgError: For non-positive definite matrices.
 
         """
         t = np.atleast_1d(t)
@@ -181,18 +123,18 @@ class GP(ModelSet):
         self._t = t
         self._yerr = np.empty_like(self._t)
         self._yerr[:] = yerr
-        if self.solver is None:
-            if self._use_sparse:
-                self.solver = solver.SparseSolver()
-            else:
-                self.solver = solver.Solver(self._use_lapack)
         (alpha_real, beta_real, alpha_complex_real, alpha_complex_imag,
          beta_complex_real, beta_complex_imag) = self.kernel.coefficients
+        self._A = np.empty(0) if A is None else A
+        self._U = np.empty((0, 0)) if U is None else U
+        self._V = np.empty((0, 0)) if V is None else V
         self.solver.compute(
+            self.kernel.jitter,
             alpha_real, beta_real,
             alpha_complex_real, alpha_complex_imag,
             beta_complex_real, beta_complex_imag,
-            t, self._get_diag()
+            self._A, self._U, self._V,
+            t, self._yerr**2
         )
         self.dirty = False
 
@@ -200,7 +142,8 @@ class GP(ModelSet):
         if not self.computed:
             if self._t is None:
                 raise RuntimeError("you must call 'compute' first")
-            self.compute(self._t, self._yerr, check_sorted=False)
+            self.compute(self._t, self._yerr, check_sorted=False,
+                         A=self._A, U=self._U, V=self._V)
 
     def _process_input(self, y):
         if self._t is None:
@@ -209,7 +152,7 @@ class GP(ModelSet):
             raise ValueError("dimension mismatch")
         return np.ascontiguousarray(y, dtype=float)
 
-    def log_likelihood(self, y, _const=math.log(2.0*math.pi)):
+    def log_likelihood(self, y, _const=math.log(2.0*math.pi), quiet=False):
         """
         Compute the marginalized likelihood of the GP model
 
@@ -219,22 +162,105 @@ class GP(ModelSet):
         Args:
             y (array[n]): The observations at coordinates ``x`` from
                 :func:`GP.compute`.
+            quiet (bool): If true, return ``-numpy.inf`` for non-positive
+                definite matrices instead of throwing an error.
 
         Returns:
             float: The marginalized likelihood of the GP model.
 
         Raises:
             ValueError: For mismatched dimensions.
+            solver.LinAlgError: For non-positive definite matrices.
 
         """
         y = self._process_input(y)
         resid = y - self.mean.get_value(self._t)
-        self._recompute()
+        try:
+            self._recompute()
+        except solver.LinAlgError:
+            if quiet:
+                return -np.inf
+            raise
         if len(y.shape) > 1:
             raise ValueError("dimension mismatch")
-        return -0.5 * (self.solver.dot_solve(resid) +
-                       self.solver.log_determinant() +
-                       len(y) * _const)
+        logdet = self.solver.log_determinant()
+        if not np.isfinite(logdet):
+            return -np.inf
+        loglike = -0.5*(self.solver.dot_solve(resid)+logdet+len(y)*_const)
+        if not np.isfinite(loglike):
+            return -np.inf
+        return loglike
+
+    def grad_log_likelihood(self, y, quiet=False):
+        """
+        Compute the gradient of the marginalized likelihood
+
+        The factorized matrix from the previous call to :func:`GP.compute` is
+        used so ``compute`` must be called first. The gradient is taken with
+        respect to the parameters returned by :func:`GP.get_parameter_vector`.
+        This function requires the `autograd
+        <https://github.com/HIPS/autograd>`_ package.
+
+        Args:
+            y (array[n]): The observations at coordinates ``x`` from
+                :func:`GP.compute`.
+            quiet (bool): If true, return ``-numpy.inf`` and a gradient vector
+                of zeros for non-positive definite matrices instead of
+                throwing an error.
+
+        Returns:
+            The gradient of marginalized likelihood with respect to the
+            parameter vector.
+
+        Raises:
+            ValueError: For mismatched dimensions.
+            solver.LinAlgError: For non-positive definite matrices.
+
+        """
+        if not solver.has_autodiff():
+            raise RuntimeError("celerite must be compiled with autodiff "
+                               "support to use the gradient methods")
+
+        if not self.kernel.vector_size:
+            return self.log_likelihood(y, quiet=quiet), np.empty(0)
+
+        y = self._process_input(y)
+        if len(y.shape) > 1:
+            raise ValueError("dimension mismatch")
+        resid = y - self.mean.get_value(self._t)
+
+        (alpha_real, beta_real, alpha_complex_real, alpha_complex_imag,
+         beta_complex_real, beta_complex_imag) = self.kernel.coefficients
+        try:
+            val, grad = self.solver.grad_log_likelihood(
+                self.kernel.jitter,
+                alpha_real, beta_real,
+                alpha_complex_real, alpha_complex_imag,
+                beta_complex_real, beta_complex_imag,
+                self._A, self._U, self._V,
+                self._t, resid, self._yerr**2
+            )
+        except solver.LinAlgError:
+            if quiet:
+                return -np.inf, np.zeros(self.vector_size)
+            raise
+
+        if self.kernel._has_coeffs:
+            coeffs_jac = self.kernel.get_coeffs_jacobian()
+            full_grad = np.dot(coeffs_jac, grad[1:])
+        else:
+            full_grad = np.zeros(self.kernel.vector_size)
+        if self.kernel._has_jitter:
+            jitter_jac = self.kernel.get_jitter_jacobian()
+            full_grad += jitter_jac * grad[0]
+
+        if self.mean.vector_size:
+            self._recompute()
+            alpha = self.solver.solve(resid)
+            g = self.mean.get_gradient(self._t)
+            full_grad = np.append(full_grad, np.dot(g, alpha))
+
+        return val, full_grad
 
     def apply_inverse(self, y):
         """
@@ -259,7 +285,8 @@ class GP(ModelSet):
         self._recompute()
         return self.solver.solve(self._process_input(y))
 
-    def dot(self, y, kernel=None):
+    def dot(self, y, t=None, A=None, U=None, V=None, kernel=None,
+            check_sorted=True):
         """
         Dot the covariance matrix into a vector or matrix
 
@@ -283,13 +310,34 @@ class GP(ModelSet):
         """
         if kernel is None:
             kernel = self.kernel
+
+        if t is not None:
+            t = np.atleast_1d(t)
+            if check_sorted and np.any(np.diff(t) < 0.0):
+                raise ValueError("the input coordinates must be sorted")
+            if check_sorted and len(t.shape) > 1:
+                raise ValueError("dimension mismatch")
+
+            A = np.empty(0) if A is None else A
+            U = np.empty((0, 0)) if U is None else U
+            V = np.empty((0, 0)) if V is None else V
+        else:
+            if not self.computed:
+                raise RuntimeError("you must call 'compute' first")
+            t = self._t
+            A = self._A
+            U = self._U
+            V = self._V
+
         (alpha_real, beta_real, alpha_complex_real, alpha_complex_imag,
          beta_complex_real, beta_complex_imag) = kernel.coefficients
+
         return self.solver.dot(
+            kernel.jitter,
             alpha_real, beta_real,
             alpha_complex_real, alpha_complex_imag,
             beta_complex_real, beta_complex_imag,
-            self._t, self._process_input(y)
+            A, U, V, t, np.ascontiguousarray(y, dtype=float)
         )
 
     def predict(self, y, t=None, return_cov=True, return_var=False):
@@ -301,18 +349,18 @@ class GP(ModelSet):
         Args:
             y (array[n]): The observations at coordinates ``x`` from
                 :func:`GP.compute`.
-        t (Optional[array[ntest]]): The independent coordinates where the
-            prediction should be made. If this is omitted the coordinates will
-            be assumed to be ``x`` from :func:`GP.compute` and an efficient
-            method will be used to compute the prediction.
-        return_cov (Optional[bool]): If ``True``, the full covariance matrix
-            is computed and returned. Otherwise, only the mean prediction is
-            computed. (default: ``True``)
-        return_var (Optional[bool]): If ``True``, only return the diagonal of
-            the predictive covariance; this will be faster to compute than the
-            full covariance matrix. This overrides ``return_cov`` so, if both
-            are set to ``True``, only the diagonal is computed.
-            (default: ``False``)
+            t (Optional[array[ntest]]): The independent coordinates where the
+                prediction should be made. If this is omitted the coordinates
+                will be assumed to be ``x`` from :func:`GP.compute` and an
+                efficient method will be used to compute the prediction.
+            return_cov (Optional[bool]): If ``True``, the full covariance
+                matrix is computed and returned. Otherwise, only the mean
+                prediction is computed. (default: ``True``)
+            return_var (Optional[bool]): If ``True``, only return the diagonal
+                of the predictive covariance; this will be faster to compute
+                than the full covariance matrix. This overrides ``return_cov``
+                so, if both are set to ``True``, only the diagonal is computed.
+                (default: ``False``)
 
         Returns:
             ``mu``, ``(mu, cov)``, or ``(mu, var)`` depending on the values of
@@ -342,10 +390,12 @@ class GP(ModelSet):
 
         # Compute the predictive mean.
         resid = y - self.mean.get_value(self._t)
-        alpha = self.solver.solve(resid).flatten()
 
         if t is None:
-            alpha = resid - self._get_diag() * alpha
+            alpha = self.solver.solve(resid).flatten()
+            alpha = resid - (self._yerr**2 + self.kernel.jitter) * alpha
+        elif not len(self._A):
+            alpha = self.solver.predict(resid, xs)
         else:
             Kxs = self.get_matrix(xs, self._t)
             alpha = np.dot(Kxs, alpha)
@@ -355,8 +405,7 @@ class GP(ModelSet):
             return mu
 
         # Predictive variance.
-        if t is None:
-            Kxs = self.get_matrix(xs, self._t)
+        Kxs = self.get_matrix(xs, self._t)
         KxsT = np.ascontiguousarray(Kxs.T, dtype=np.float64)
         if return_var:
             var = -np.sum(KxsT*self.apply_inverse(KxsT), axis=0)
@@ -368,11 +417,8 @@ class GP(ModelSet):
         cov -= np.dot(Kxs, self.apply_inverse(KxsT))
         return mu, cov
 
-    def _get_diag(self):
-        return self._yerr**2 + np.exp(self.log_white_noise
-                                      .get_value(self._t))
-
-    def get_matrix(self, x1=None, x2=None, include_diagonal=None):
+    def get_matrix(self, x1=None, x2=None, include_diagonal=None,
+                   include_general=None):
         """
         Get the covariance matrix at given independent coordinates
 
@@ -393,7 +439,13 @@ class GP(ModelSet):
                 raise RuntimeError("you must call 'compute' first")
             K = self.kernel.get_value(self._t[:, None] - self._t[None, :])
             if include_diagonal is None or include_diagonal:
-                K[np.diag_indices_from(K)] += self._get_diag()
+                K[np.diag_indices_from(K)] += (
+                    self._yerr**2 + self.kernel.jitter
+                )
+            if (include_general is None or include_general) and len(self._A):
+                K[np.diag_indices_from(K)] += self._A
+                K += np.tril(np.dot(self._U.T, self._V), -1)
+                K += np.triu(np.dot(self._V.T, self._U), 1)
             return K
 
         incl = False
@@ -403,23 +455,14 @@ class GP(ModelSet):
             incl = include_diagonal is not None and include_diagonal
         K = self.kernel.get_value(x1[:, None] - x2[None, :])
         if incl:
-            K[np.diag_indices_from(K)] += np.exp(self.log_white_noise
-                                                 .get_value(x1))
+            K[np.diag_indices_from(K)] += self.kernel.jitter
         return K
 
-    def sample(self, x=None, diag=None, include_diagonal=False, size=None):
+    def sample(self, size=None):
         """
         Sample from the prior distribution over datasets
 
         Args:
-            x (Optional[array[n]]): The independent coordinates where the
-                observations should be made. If ``None``, the coordinates used
-                in the last call to ``compute`` will be used.
-            diag (Optional[array[n] or float]): If provided, this will be
-                added to the diagonal of the covariance matrix.
-            include_diagonal (Optional[bool]): Should the white noise and/or
-                ``yerr`` terms be included on the diagonal?
-                (default: ``False``)
             size (Optional[int]): The number of samples to draw.
 
         Returns:
@@ -427,27 +470,36 @@ class GP(ModelSet):
             distribution over datasets.
 
         """
-        K = self.get_matrix(x, include_diagonal=include_diagonal)
-        if diag is not None:
-            K[np.diag_indices_from(K)] += diag
-        sample = np.random.multivariate_normal(np.zeros_like(x), K, size=size)
-        return self.mean.get_value(x) + sample
-
-    def sample_uniform(self, x_min, x_max, nx, size=None):
-        x = np.linspace(x_min, x_max, nx)
-        dx = x - x[0]
-
-        k = self.kernel.get_value(dx)
-        s = np.append(k, k[1:-1][::-1])
-        M = len(s)
-        Fs = np.sqrt(M*np.fft.fft(s))
+        self._recompute()
         if size is None:
-            nr = 1
+            n = np.random.randn(len(self._t))
         else:
-            nr = int(np.ceil(0.5 * size))
-        e = (np.random.randn(nr, M) + 1.j * np.random.randn(nr, M)) * Fs
-        y = np.fft.ifft(e)[:, :nx]
+            n = np.random.randn(len(self._t), size)
+        n = self.solver.dot_L(n)
         if size is None:
-            return y[0].real
-        y = np.concatenate((y.real, y.imag), axis=0)
-        return y[:size]
+            return self.mean.get_value(self._t) + n[:, 0]
+        return self.mean.get_value(self._t)[None, :] + n.T
+
+    def sample_conditional(self, y, t=None, size=None):
+        """
+        Sample from the conditional (predictive) distribution
+
+        Note: this method scales as ``O(M^3)`` for large ``M``, where
+        ``M == len(t)``.
+
+        Args:
+            y (array[n]): The observations at coordinates ``x`` from
+                :func:`GP.compute`.
+            t (Optional[array[ntest]]): The independent coordinates where the
+                prediction should be made. If this is omitted the coordinates
+                will be assumed to be ``x`` from :func:`GP.compute` and an
+                efficient method will be used to compute the prediction.
+            size (Optional[int]): The number of samples to draw.
+
+        Returns:
+            array[n] or array[size, n]: The samples from the conditional
+            distribution over datasets.
+
+        """
+        mu, cov = self.predict(y, t, return_cov=True)
+        return np.random.multivariate_normal(mu, cov, size=size)

@@ -7,7 +7,7 @@ then
   then
     echo "Building the paper..."
     export CELERITE_BUILDING_PAPER=true
-    source "$( dirname "${BASH_SOURCE[0]}" )"/setup-texlive.sh
+    source "$( dirname "${BASH_SOURCE[0]}" )"/setup-tectonic.sh
     return
   fi
   export CELERITE_BUILDING_PAPER=false
@@ -50,15 +50,24 @@ conda update -q conda
 conda info -a
 conda create --yes -n test python=$PYTHON_VERSION
 source activate test
-conda install -c conda-forge numpy=$NUMPY_VERSION setuptools eigen pybind11 pytest mkl
+conda install -c conda-forge numpy=$NUMPY_VERSION setuptools pytest pytest-cov pybind11 $AUTOGRAD pip
+pip install coveralls
 
-if [[ "$TRAVIS_OS_NAME" == "mkl" ]]; then
-  conda install mkl
+if [[ $AUTODIFF_LIBRARY == stan ]]
+then
+  mkdir -p stan
+  cd stan
+  wget "https://github.com/stan-dev/math/archive/v2.15.0.tar.gz"
+  tar -xf v2.15.0.tar.gz --strip-components 1
+  cd ..
+
+  CXX=g++-4.8 CC=gcc-4.8 python setup.py build_ext "-Istan/stan -Istan/lib/boost_1.62.0 -Istan/lib/cvodes_2.9.0/include -DUSE_STAN_MATH" install
+  return
 fi
 
 # Build the extension
 if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then
-  python setup.py install $BUILD_ARGS
+  python setup.py develop
 else
-  CXX=g++-4.8 CC=gcc-4.8 python setup.py install $BUILD_ARGS
+  CXX=g++-4.8 CC=gcc-4.8 python setup.py build_ext $BUILD_ARGS develop
 fi

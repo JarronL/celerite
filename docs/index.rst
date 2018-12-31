@@ -45,13 +45,15 @@ celerite is being actively developed in `a public repository on GitHub
     :target: https://travis-ci.org/dfm/celerite
 .. image:: https://ci.appveyor.com/api/projects/status/74al24yklrlrvwni?svg=true&style=flat
     :target: https://ci.appveyor.com/project/dfm/celerite
-.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.438359.svg?style=flat
-   :target: https://doi.org/10.5281/zenodo.438359
-.. image:: https://img.shields.io/badge/PDF-latest-orange.svg?style=flat
-    :target: https://github.com/dfm/celerite/blob/master-pdf/paper/ms.pdf
-.. image:: https://img.shields.io/badge/ArXiv-TBD-orange.svg?style=flat
-    :target: https://arxiv.org
 
+.. raw:: html
+
+    <br>
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.806847.svg?style=flat
+   :target: https://doi.org/10.5281/zenodo.806847
+.. image:: https://img.shields.io/badge/ArXiv-1703.09710-orange.svg?style=flat
+    :target: https://arxiv.org/abs/1703.09710
 
 .. toctree::
    :maxdepth: 2
@@ -107,20 +109,18 @@ Copyright 2016, 2017, Daniel Foreman-Mackey, Eric Agol and contributors.
 
 The source code is made available under the terms of the MIT license.
 
-If you make use of this code, please cite the following papers:
+If you make use of this code, please cite the following paper:
 
 .. code-block:: tex
 
-    @article{genrp,
-         author = {Sivaram Ambikasaran},
-          title = {Generalized Rybicki Press algorithm},
-           year = {2015},
-        journal = {Numer. Linear Algebra Appl.},
-         volume = {22},
-         number = {6},
-          pages = {1102--1114},
-            doi = {10.1002/nla.2003},
-            url = {https://arxiv.org/abs/1409.7852}
+    @article{celerite,
+        author = {{Foreman-Mackey}, D. and {Agol}, E. and {Angus}, R. and
+                  {Ambikasaran}, S.},
+         title = {Fast and scalable Gaussian process modeling
+                  with applications to astronomical time series},
+          year = {2017},
+       journal = {ArXiv},
+           url = {https://arxiv.org/abs/1703.09710}
     }
 
 
